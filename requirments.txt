@@ -1,0 +1,25 @@
+# requirements.txt
+# Основные зависимости для CoCoA эксперимента
+
+# PyTorch и трансформеры
+torch>=2.0.0
+transformers>=4.35.0
+accelerate>=0.25.0
+bitsandbytes>=0.41.0
+
+# Sentence Transformers для семантического сходства
+sentence-transformers>=2.2.0
+
+# Датасеты и оценка
+datasets>=2.14.0
+evaluate>=0.4.0
+
+# Утилиты
+pandas>=2.0.0
+tqdm>=4.65.0
+scikit-learn>=1.3.0
+huggingface_hub>=0.19.0
+openpyxl>=3.1.0
+
+# Опционально (для GPU)
+# nvidia-cuda-runtime-cu11>=11.8.0  # Раскомментировать если нужен CUDA
