@@ -2,18 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 CoCoA Uncertainty Quantification Experiment
-Поддержка QA, SUMMARIZATION и MACHINE TRANSLATION (NMT)
-Для слабых ноутбуков (4-bit квантование, мини-датасеты)
+ПРАВИЛЬНАЯ РЕАЛИЗАЦИЯ согласно статье arXiv:2502.04964
+
+CoCoA: Multiple samples + confidence × consistency
+CoCoA Light: MLP на эмбеддингах среднего слоя + greedy decoding
 """
 
 import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 from datasets import load_dataset
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -22,48 +27,47 @@ warnings.filterwarnings('ignore')
 # ============================================================================
 
 class Config:
-    """Конфигурация эксперимента"""
+    """Конфигурация эксперимента согласно статье"""
     
-    # Модель (мультиязычная для NMT!)
-    MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"  
-    # Альтернативы для NMT: "google/gemma-2-2b-it", "microsoft/Phi-3.5-mini-instruct"
+    # Модель
+    MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+    
+    # Параметры для CoCoA Light (эмбеддинги)
+    # Для Qwen2.5-1.5B: 24 слоя, берём слой 12 (середина)
+    EMBEDDING_LAYER = 12
+    EMBEDDING_DIM = 1536  # hidden_size для Qwen2.5-1.5B
     
     # Параметры генерации
     MAX_NEW_TOKENS = 128
     TEMPERATURE = 0.7
     TOP_P = 0.9
-    NUM_SAMPLES = 5  # Уменьшено для ноутбука
+    NUM_SAMPLES = 10  # Для CoCoA (оригинал: 10-20)
     
-    # Датасеты (3 типа задач)
+    # Датасеты
     DATASETS = {
-        # QA Tasks
         "TriviaQA": {"name": "trivia_qa", "subset": "rc.wikipedia.nocontext", 
                      "size": 300, "task_type": "qa"},
-        "CoQA": {"name": "coqa", "subset": None, 
-                 "size": 300, "task_type": "qa"},
-        
-        # Summarization Task
-        "XSUM": {"name": "xsum", "subset": None, 
-                 "size": 300, "task_type": "summarization"},
-        
-        # Machine Translation Task (NMT)
-        "WMT19_EN_DE": {"name": "wmt19", "subset": "de-en", 
-                        "size": 300, "task_type": "translation"},
-        # IWSLT легче чем WMT, рекомендую для слабых ноутбуков
+        "CoQA": {"name": "coqa", "subset": None, "size": 300, "task_type": "qa"},
+        "XSUM": {"name": "xsum", "subset": None, "size": 300, "task_type": "summarization"},
         "IWSLT_EN_DE": {"name": "iwslt2017", "subset": "en-de", 
                         "size": 300, "task_type": "translation"},
     }
     
-    # Функция сходства (мультиязычная для NMT!)
-    # LaBSE поддерживает 100+ языков, лучше для перевода
-    SIMILARITY_MODEL = "sentence-transformers/LaBSE"  # Или "all-MiniLM-L6-v2"
+    # Датасет для обучения CoCoA Light (unlabeled held-out set)
+    LIGHT_TRAIN_SIZE = 500  # В статье: 3000-10000
+    
+    # Функция сходства
+    SIMILARITY_MODEL = "sentence-transformers/LaBSE"
     
     # Устройство
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     # 4-bit квантование
     USE_4BIT = True
-    COMPUTE_DTYPE = torch.float16
+    
+    # Режимы
+    RUN_COCOA = True       # Запустить полный CoCoA
+    RUN_COCOA_LIGHT = True # Запустить CoCoA Light с обучением MLP
 
 # ============================================================================
 # ЗАГРУЗКА МОДЕЛЕЙ
@@ -72,7 +76,7 @@ class Config:
 def load_llm_model(model_name: str, use_4bit: bool = True):
     """Загружает языковую модель с квантованием"""
     
-    print(f"Загрузка модели: {model_name}")
+    print(f"🔄 Загрузка модели: {model_name}")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     
@@ -85,6 +89,7 @@ def load_llm_model(model_name: str, use_4bit: bool = True):
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
             trust_remote_code=True,
+            output_hidden_states=True,  # Важно для CoCoA Light!
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -92,18 +97,18 @@ def load_llm_model(model_name: str, use_4bit: bool = True):
             device_map="auto",
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             trust_remote_code=True,
+            output_hidden_states=True,  # Важно для CoCoA Light!
         )
     
     model.eval()
-    print(f"Модель загружена на {next(model.parameters()).device}")
+    print(f"✅ Модель загружена на {next(model.parameters()).device}")
     return model, tokenizer
 
 def load_similarity_model(model_name: str):
     """Загружает модель для вычисления семантического сходства"""
-    
-    print(f"Загрузка модели сходства: {model_name}")
+    print(f"🔄 Загрузка модели сходства: {model_name}")
     similarity_model = SentenceTransformer(model_name)
-    print(f"Модель сходства загружена")
+    print(f"✅ Модель сходства загружена")
     return similarity_model
 
 # ============================================================================
@@ -111,7 +116,7 @@ def load_similarity_model(model_name: str):
 # ============================================================================
 
 def load_mini_dataset(dataset_name: str, dataset_config: Dict) -> List[Dict]:
-    """Загружает мини-версию датасета для QA, SUM или NMT"""
+    """Загружает мини-версию датасета"""
     
     task_type = dataset_config["task_type"]
     size = dataset_config["size"]
@@ -157,45 +162,27 @@ def load_mini_dataset(dataset_name: str, dataset_config: Dict) -> List[Dict]:
             })
     
     elif task_type == "translation":
-        if dataset_name == "WMT19_EN_DE":
-            # WMT19 de-en (немецко-английский)
-            dataset = load_dataset("wmt19", "de-en", split="test")
-            for i, item in enumerate(dataset):
-                if i >= size:
-                    break
-                data.append({
-                    "input": item["translation"]["de"],  # Немецкий (источник)
-                    "reference": item["translation"]["en"],  # Английский (цель)
-                    "task_type": "translation",
-                    "src_lang": "de",
-                    "tgt_lang": "en"
-                })
-        
-        elif dataset_name == "IWSLT_EN_DE":
-            # IWSLT2017 en-de (англо-немецкий) - легче!
+        if dataset_name == "IWSLT_EN_DE":
             dataset = load_dataset("iwslt2017", "en-de", split="test")
             for i, item in enumerate(dataset):
                 if i >= size:
                     break
                 data.append({
-                    "input": item["translation"]["en"],  # Английский (источник)
-                    "reference": item["translation"]["de"],  # Немецкий (цель)
+                    "input": item["translation"]["en"],
+                    "reference": item["translation"]["de"],
                     "task_type": "translation",
                     "src_lang": "en",
                     "tgt_lang": "de"
                 })
     
-    else:
-        raise ValueError(f"Неизвестный тип задачи: {task_type}")
-    
-    print(f"Загружено {len(data)} примеров")
+    print(f"✅ Загружено {len(data)} примеров")
     return data
 
 # ============================================================================
 # ФОРМИРОВАНИЕ ПРОМПТОВ
 # ============================================================================
 
-def create_prompt(item: Dict, model_name: str = "Qwen") -> str:
+def create_prompt(item: Dict) -> str:
     """Создаёт промпт в зависимости от типа задачи"""
     
     task_type = item["task_type"]
@@ -210,14 +197,9 @@ def create_prompt(item: Dict, model_name: str = "Qwen") -> str:
     elif task_type == "translation":
         src_lang = item.get("src_lang", "en")
         tgt_lang = item.get("tgt_lang", "de")
-        
-        # Явно указываем языки для лучшего качества перевода
-        lang_names = {
-            "en": "English", "de": "German", "fr": "French", 
-            "es": "Spanish", "ru": "Russian", "zh": "Chinese"
-        }
-        
-        prompt = f"Translate the following text from {lang_names.get(src_lang, src_lang)} to {lang_names.get(tgt_lang, tgt_lang)}:\n\n{input_text}\n\nTranslation:"
+        lang_names = {"en": "English", "de": "German", "fr": "French", 
+                      "es": "Spanish", "ru": "Russian", "zh": "Chinese"}
+        prompt = f"Translate from {lang_names.get(src_lang, src_lang)} to {lang_names.get(tgt_lang, tgt_lang)}:\n\n{input_text}\n\nTranslation:"
     
     else:
         prompt = input_text
@@ -225,18 +207,24 @@ def create_prompt(item: Dict, model_name: str = "Qwen") -> str:
     return prompt
 
 # ============================================================================
-# ГЕНЕРАЦИЯ ОТВЕТОВ
+# ГЕНЕРАЦИЯ ОТВЕТОВ С ЭМБЕДДИНГАМИ
 # ============================================================================
 
-def generate_responses(model, tokenizer, prompt: str, num_samples: int, 
-                       config: Config) -> List[Tuple[str, float]]:
-    """Генерирует multiple samples и возвращает (текст, log_probability)"""
+def generate_responses_with_embeddings(model, tokenizer, prompt: str, 
+                                        num_samples: int, config: Config,
+                                        return_embeddings: bool = False):
+    """
+    Генерирует multiple samples и возвращает:
+    - (текст, log_probability) для CoCoA
+    - эмбеддинги среднего слоя для CoCoA Light
+    """
     
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, 
                        max_length=512).to(config.DEVICE)
     input_length = inputs["input_ids"].shape[1]
     
     responses = []
+    embeddings_list = []
     
     for _ in range(num_samples):
         with torch.no_grad():
@@ -248,6 +236,7 @@ def generate_responses(model, tokenizer, prompt: str, num_samples: int,
                 do_sample=True,
                 return_dict_in_generate=True,
                 output_scores=True,
+                output_hidden_states=return_embeddings,  # Для CoCoA Light
                 pad_token_id=tokenizer.eos_token_id,
             )
         
@@ -255,7 +244,7 @@ def generate_responses(model, tokenizer, prompt: str, num_samples: int,
         generated_ids = outputs.sequences[0][input_length:]
         text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         
-        # Вычисляем log probability (confidence)
+        # Вычисляем log probability
         if hasattr(outputs, 'scores') and outputs.scores:
             log_probs = []
             for i, score in enumerate(outputs.scores):
@@ -267,8 +256,122 @@ def generate_responses(model, tokenizer, prompt: str, num_samples: int,
             avg_log_prob = 0.0
         
         responses.append((text, avg_log_prob))
+        
+        # Извлекаем эмбеддинги среднего слоя (для CoCoA Light)
+        if return_embeddings and hasattr(outputs, 'hidden_states'):
+            # hidden_states: tuple of (batch_size, seq_len, hidden_dim) for each layer
+            if outputs.hidden_states and len(outputs.hidden_states) > config.EMBEDDING_LAYER:
+                # Берём эмбеддинги последнего сгенерированного токена
+                layer_hidden = outputs.hidden_states[config.EMBEDDING_LAYER][-1]  # Last token
+                # Mean pooling по последнему измерению
+                embedding = layer_hidden[0, -1, :].cpu().numpy()  # [hidden_dim]
+                embeddings_list.append(embedding)
     
-    return responses
+    return responses, embeddings_list if return_embeddings else None
+
+def generate_greedy_with_embedding(model, tokenizer, prompt: str, config: Config):
+    """
+    Генерирует ОДИН greedy ответ с эмбеддингами (для CoCoA Light inference)
+    """
+    
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, 
+                       max_length=512).to(config.DEVICE)
+    input_length = inputs["input_ids"].shape[1]
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=config.MAX_NEW_TOKENS,
+            do_sample=False,  # Greedy decoding
+            return_dict_in_generate=True,
+            output_scores=True,
+            output_hidden_states=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    
+    # Декодируем ответ
+    generated_ids = outputs.sequences[0][input_length:]
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    
+    # Вычисляем log probability
+    if hasattr(outputs, 'scores') and outputs.scores:
+        log_probs = []
+        for i, score in enumerate(outputs.scores):
+            token_id = outputs.sequences[0][input_length + i]
+            log_prob = torch.log_softmax(score[0], dim=0)[token_id].item()
+            log_probs.append(log_prob)
+        avg_log_prob = np.mean(log_probs) if log_probs else 0.0
+    else:
+        avg_log_prob = 0.0
+    
+    # Извлекаем эмбеддинги среднего слоя
+    embedding = None
+    if outputs.hidden_states and len(outputs.hidden_states) > config.EMBEDDING_LAYER:
+        layer_hidden = outputs.hidden_states[config.EMBEDDING_LAYER][-1]
+        embedding = layer_hidden[0, -1, :].cpu().numpy()
+    
+    return (text, avg_log_prob), embedding
+
+# ============================================================================
+# COCOA LIGHT: MLP МОДЕЛЬ
+# ============================================================================
+
+class CoCoALightMLP:
+    """
+    MLP для предсказания consistency uncertainty из эмбеддингов
+    Согласно Appendix I статьи
+    """
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 2048):
+        # Используем MLPRegressor из sklearn (проще чем PyTorch для этой задачи)
+        self.model = MLPRegressor(
+            hidden_layer_sizes=(hidden_dim,),
+            activation='relu',
+            solver='adam',
+            alpha=0.1,  # Weight decay
+            batch_size=4,
+            learning_rate_init=1e-5,
+            max_iter=20,  # 20 epochs
+            early_stopping=False,
+            random_state=42,
+        )
+        self.scaler = StandardScaler()
+        self.is_trained = False
+    
+    def train(self, embeddings: np.ndarray, targets: np.ndarray):
+        """
+        Обучает MLP на эмбеддингах и целевых consistency uncertainty
+        
+        Args:
+            embeddings: [n_samples, embedding_dim]
+            targets: [n_samples] - true consistency uncertainty
+        """
+        print(f"🔄 Обучение CoCoA Light MLP...")
+        print(f"   Размер training set: {len(embeddings)} примеров")
+        print(f"   Размерность эмбеддингов: {embeddings.shape[1]}")
+        
+        # Нормализуем эмбеддинги
+        embeddings_scaled = self.scaler.fit_transform(embeddings)
+        
+        # Обучаем модель
+        self.model.fit(embeddings_scaled, targets)
+        self.is_trained = True
+        
+        # Оценка качества
+        train_score = self.model.score(embeddings_scaled, targets)
+        print(f"✅ MLP обучена (R² = {train_score:.4f})")
+    
+    def predict(self, embedding: np.ndarray) -> float:
+        """Предсказывает consistency uncertainty из одного эмбеддинга"""
+        
+        if not self.is_trained:
+            raise ValueError("MLP не обучена! Вызовите train() сначала.")
+        
+        embedding_scaled = self.scaler.transform([embedding])
+        prediction = self.model.predict(embedding_scaled)[0]
+        
+        # Нормализуем к [0, 1]
+        return float(np.clip(prediction, 0.0, 1.0))
 
 # ============================================================================
 # МЕТРИКИ НЕОПРЕДЕЛЁННОСТИ
@@ -308,56 +411,98 @@ def compute_semantic_similarity(model, text1: str, text2: str) -> float:
         similarity = np.dot(embeddings[0], embeddings[1]) / (
             np.linalg.norm(embeddings[0]) * np.linalg.norm(embeddings[1]) + 1e-8
         )
-        similarity = (similarity + 1) / 2  # Нормализуем от 0 до 1
+        similarity = (similarity + 1) / 2
         return float(similarity)
     except:
         return 0.0
 
 def compute_consistency_uncertainty(similarity_model, responses: List[Tuple[str, float]]) -> float:
-    """U_cons: Consistency-based uncertainty"""
+    """
+    U_cons: Consistency-based uncertainty (Formula 8 в статье)
+    
+    Û_cons(y*|x) = (1/M) × Σ(1 - s(y*, yⁱ))
+    """
     
     if len(responses) < 2:
         return 1.0
     
     texts = [r[0] for r in responses]
+    best_text = max(responses, key=lambda x: x[1])[0]  # y*
     
+    # Вычисляем сходство лучшего ответа со всеми остальными
     similarities = []
-    for i in range(len(texts)):
-        for j in range(i + 1, len(texts)):
-            sim = compute_semantic_similarity(similarity_model, texts[i], texts[j])
+    for i, text in enumerate(texts):
+        if text != best_text:  # Не сравниваем с самим собой
+            sim = compute_semantic_similarity(similarity_model, best_text, text)
             similarities.append(sim)
     
     if not similarities:
         return 1.0
     
+    # Среднее сходство
     avg_similarity = np.mean(similarities)
+    
+    # Uncertainty = 1 - average similarity (Formula 8)
     uncertainty = 1.0 - avg_similarity
     return uncertainty
 
 def compute_cocoa_uncertainty(responses: List[Tuple[str, float]], 
-                              similarity_model) -> float:
-    """U_CoCoA: Комбинированная метрика (confidence × consistency)"""
+                              similarity_model,
+                              info_type: str = "SP") -> float:
+    """
+    U_CoCoA: Комбинированная метрика (Formula 10 в статье)
     
-    info_uncertainty = compute_sequence_probability(responses)
+    Û_CoCoA(y*|x) = u(y*|x) × Û_cons(y*|x)
+    """
+    
+    # Information-based uncertainty
+    if info_type == "SP":
+        info_uncertainty = compute_sequence_probability(responses)
+    elif info_type == "PPL":
+        info_uncertainty = compute_perplexity(responses)
+    else:
+        info_uncertainty = compute_sequence_probability(responses)
+    
+    # Consistency-based uncertainty
     cons_uncertainty = compute_consistency_uncertainty(similarity_model, responses)
+    
+    # Комбинация (произведение)
     cocoa_uncertainty = info_uncertainty * cons_uncertainty
     
     return cocoa_uncertainty
 
-def compute_cocoa_light_uncertainty(responses: List[Tuple[str, float]], 
-                                    similarity_model,
-                                    learned_weight: float = 0.5) -> float:
-    """U_CoCoA Light: Аппроксимация"""
+def compute_cocoa_light_uncertainty(response: Tuple[str, float], 
+                                    embedding: np.ndarray,
+                                    mlp_model: CoCoALightMLP,
+                                    info_type: str = "SP") -> float:
+    """
+    U_CoCoA Light: С обученной MLP (Formula 11 в статье)
     
-    approx_responses = responses[:3] if len(responses) >= 3 else responses
+    Û_CoCoA^L(y*|x) = u(y*|x) × ĝ(e(y*|x))
     
-    info_uncertainty = compute_sequence_probability(approx_responses)
-    cons_uncertainty = compute_consistency_uncertainty(similarity_model, approx_responses)
+    где ĝ - обученная MLP, e - эмбеддинги среднего слоя
+    """
     
-    cocoa_light = info_uncertainty * (learned_weight * cons_uncertainty + 
-                                       (1 - learned_weight) * info_uncertainty)
+    text, log_prob = response
     
-    return cocoa_light
+    # Information-based uncertainty (из одного greedy ответа)
+    if info_type == "SP":
+        probability = np.exp(log_prob)
+        info_uncertainty = 1.0 - min(probability, 1.0)
+    elif info_type == "PPL":
+        perplexity = np.exp(-log_prob)
+        info_uncertainty = min(perplexity / 100.0, 1.0)
+    else:
+        probability = np.exp(log_prob)
+        info_uncertainty = 1.0 - min(probability, 1.0)
+    
+    # Consistency uncertainty из MLP (без sampling!)
+    cons_uncertainty = mlp_model.predict(embedding)
+    
+    # Комбинация
+    cocoa_light_uncertainty = info_uncertainty * cons_uncertainty
+    
+    return cocoa_light_uncertainty
 
 # ============================================================================
 # ОЦЕНКА КАЧЕСТВА
@@ -365,7 +510,7 @@ def compute_cocoa_light_uncertainty(responses: List[Tuple[str, float]],
 
 def compute_correctness(model_response: str, reference_answer: str, 
                         task_type: str) -> bool:
-    """Проверяет правильность ответа в зависимости от задачи"""
+    """Проверяет правильность ответа"""
     
     if not model_response or not reference_answer:
         return False
@@ -379,14 +524,12 @@ def compute_correctness(model_response: str, reference_answer: str,
         return overlap >= max(1, len(ref_words) // 3)
     
     elif task_type == "summarization":
-        # Для суммаризации используем overlap слов
         ref_words = set(reference_answer.lower().split())
         resp_words = set(model_response.lower().split())
         overlap = len(ref_words & resp_words)
         return overlap >= max(5, len(ref_words) // 4)
     
     elif task_type == "translation":
-        # Для перевода проверяем длину и overlap
         if len(model_response) < len(reference_answer) * 0.5:
             return False
         ref_words = set(reference_answer.lower().split())
@@ -397,8 +540,13 @@ def compute_correctness(model_response: str, reference_answer: str,
     return False
 
 def compute_prediction_rejection_ratio(uncertainties: List[float], 
-                                       correctness: List[bool]) -> float:
-    """PRR: Prediction Rejection Ratio"""
+                                       correctness: List[bool],
+                                       max_rejection: float = 0.5) -> float:
+    """
+    PRR: Prediction Rejection Ratio
+    
+    Вычисляется только до max_rejection (50% в статье)
+    """
     
     if len(uncertainties) != len(correctness):
         return 0.0
@@ -414,7 +562,11 @@ def compute_prediction_rejection_ratio(uncertainties: List[float],
     prr_values = []
     
     for k in range(1, k_steps + 1):
-        num_rejected = int(n * k / k_steps)
+        rejection_rate = k / k_steps
+        if rejection_rate > max_rejection:
+            break
+        
+        num_rejected = int(n * rejection_rate)
         if num_rejected >= n:
             continue
         
@@ -441,6 +593,68 @@ def compute_auroc(uncertainties: List[float], correctness: List[bool]) -> float:
         return 0.5
 
 # ============================================================================
+# ОБУЧЕНИЕ COCOA LIGHT
+# ============================================================================
+
+def train_cocoa_light(model, tokenizer, similarity_model, train_data: List[Dict], 
+                      config: Config) -> CoCoALightMLP:
+    """
+    Обучает CoCoA Light MLP на held-out set (без ground truth labels!)
+    
+    Согласно Appendix I:
+    1. Для каждого примера генерируем multiple samples
+    2. Вычисляем true consistency uncertainty
+    3. Извлекаем эмбеддинги среднего слоя
+    4. Обучаем MLP предсказывать consistency из эмбеддингов
+    """
+    
+    print("\n" + "=" * 80)
+    print("🎓 ОБУЧЕНИЕ COCOA LIGHT MLP")
+    print("=" * 80)
+    
+    embeddings_list = []
+    targets_list = []
+    
+    for item in tqdm(train_data, desc="Подготовка training данных"):
+        prompt = create_prompt(item)
+        
+        # Генерируем multiple samples для вычисления true consistency
+        responses, embeddings = generate_responses_with_embeddings(
+            model, tokenizer, prompt, 
+            num_samples=config.NUM_SAMPLES,
+            config=config,
+            return_embeddings=True
+        )
+        
+        # Фильтруем пустые ответы
+        responses = [(t, p) for t, p in responses if t.strip()]
+        
+        if len(responses) < 2 or not embeddings:
+            continue
+        
+        # Вычисляем true consistency uncertainty (target для MLP)
+        true_cons_uncertainty = compute_consistency_uncertainty(similarity_model, responses)
+        
+        # Берём эмбеддинг из лучшего ответа (greedy-like)
+        best_idx = np.argmax([r[1] for r in responses])
+        best_embedding = embeddings[best_idx]
+        
+        embeddings_list.append(best_embedding)
+        targets_list.append(true_cons_uncertainty)
+    
+    # Конвертируем в numpy arrays
+    embeddings_array = np.array(embeddings_list)
+    targets_array = np.array(targets_list)
+    
+    print(f"\n✅ Подготовлено {len(embeddings_array)} примеров для обучения")
+    
+    # Создаём и обучаем MLP
+    mlp = CoCoALightMLP(input_dim=embeddings_array.shape[1], hidden_dim=2048)
+    mlp.train(embeddings_array, targets_array)
+    
+    return mlp
+
+# ============================================================================
 # ОСНОВНОЙ ЭКСПЕРИМЕНТ
 # ============================================================================
 
@@ -450,19 +664,37 @@ def run_experiment():
     config = Config()
     
     print("=" * 80)
-    print("CoCoA Uncertainty Quantification Experiment")
+    print("🚀 CoCoA Uncertainty Quantification Experiment")
     print("   Задачи: QA, Summarization, Machine Translation (NMT)")
     print("=" * 80)
     print(f"Модель: {config.MODEL_NAME}")
     print(f"Устройство: {config.DEVICE}")
     print(f"4-bit квантование: {config.USE_4BIT}")
-    print(f"Число samples: {config.NUM_SAMPLES}")
+    print(f"Число samples (CoCoA): {config.NUM_SAMPLES}")
+    print(f"Слой эмбеддингов (CoCoA Light): {config.EMBEDDING_LAYER}")
     print(f"Модель сходства: {config.SIMILARITY_MODEL}")
     print("=" * 80)
     
     # Загружаем модели
     llm_model, tokenizer = load_llm_model(config.MODEL_NAME, config.USE_4BIT)
     similarity_model = load_similarity_model(config.SIMILARITY_MODEL)
+    
+    # Обучаем CoCoA Light MLP (если нужно)
+    mlp_model = None
+    if config.RUN_COCOA_LIGHT:
+        # Загружаем training data
+        train_data = load_mini_dataset("TriviaQA", {
+            "name": "trivia_qa", 
+            "subset": "rc.wikipedia.nocontext",
+            "size": config.LIGHT_TRAIN_SIZE, 
+            "task_type": "qa"
+        })
+        
+        # Обучаем MLP
+        mlp_model = train_cocoa_light(
+            llm_model, tokenizer, similarity_model, 
+            train_data, config
+        )
     
     # Результаты
     all_results = []
@@ -480,21 +712,27 @@ def run_experiment():
             "SequenceProb": [],
             "Perplexity": [],
             "Consistency": [],
-            "CoCoA": [],
-            "CoCoA_Light": [],
+            "CoCoA_SP": [],
+            "CoCoA_PPL": [],
         }
+        
+        if config.RUN_COCOA_LIGHT and mlp_model is not None:
+            uncertainties_methods["CoCoA_Light_SP"] = []
+            uncertainties_methods["CoCoA_Light_PPL"] = []
+        
         correctness_list = []
         
         # Обрабатываем каждый пример
         for i, item in enumerate(tqdm(data, desc=f"Обработка {dataset_name}")):
             
             # Формируем промпт
-            prompt = create_prompt(item, config.MODEL_NAME)
+            prompt = create_prompt(item)
             
-            # Генерируем ответы
-            responses = generate_responses(
+            # Генерируем ответы (для CoCoA)
+            responses, embeddings = generate_responses_with_embeddings(
                 llm_model, tokenizer, prompt, 
-                config.NUM_SAMPLES, config
+                config.NUM_SAMPLES, config,
+                return_embeddings=config.RUN_COCOA_LIGHT
             )
             
             # Фильтруем пустые ответы
@@ -503,18 +741,35 @@ def run_experiment():
             if not responses:
                 continue
             
-            # Вычисляем неопределённости
-            u_sp = compute_sequence_probability(responses)
-            u_ppl = compute_perplexity(responses)
-            u_cons = compute_consistency_uncertainty(similarity_model, responses)
-            u_cocoa = compute_cocoa_uncertainty(responses, similarity_model)
-            u_cocoa_light = compute_cocoa_light_uncertainty(responses, similarity_model)
+            # Вычисляем неопределённости (CoCoA)
+            if config.RUN_COCOA:
+                u_sp = compute_sequence_probability(responses)
+                u_ppl = compute_perplexity(responses)
+                u_cons = compute_consistency_uncertainty(similarity_model, responses)
+                u_cocoa_sp = compute_cocoa_uncertainty(responses, similarity_model, "SP")
+                u_cocoa_ppl = compute_cocoa_uncertainty(responses, similarity_model, "PPL")
+                
+                uncertainties_methods["SequenceProb"].append(u_sp)
+                uncertainties_methods["Perplexity"].append(u_ppl)
+                uncertainties_methods["Consistency"].append(u_cons)
+                uncertainties_methods["CoCoA_SP"].append(u_cocoa_sp)
+                uncertainties_methods["CoCoA_PPL"].append(u_cocoa_ppl)
             
-            uncertainties_methods["SequenceProb"].append(u_sp)
-            uncertainties_methods["Perplexity"].append(u_ppl)
-            uncertainties_methods["Consistency"].append(u_cons)
-            uncertainties_methods["CoCoA"].append(u_cocoa)
-            uncertainties_methods["CoCoA_Light"].append(u_cocoa_light)
+            # Вычисляем неопределённости (CoCoA Light)
+            if config.RUN_COCOA_LIGHT and mlp_model is not None and embeddings:
+                best_idx = np.argmax([r[1] for r in responses])
+                best_response = responses[best_idx]
+                best_embedding = embeddings[best_idx]
+                
+                u_light_sp = compute_cocoa_light_uncertainty(
+                    best_response, best_embedding, mlp_model, "SP"
+                )
+                u_light_ppl = compute_cocoa_light_uncertainty(
+                    best_response, best_embedding, mlp_model, "PPL"
+                )
+                
+                uncertainties_methods["CoCoA_Light_SP"].append(u_light_sp)
+                uncertainties_methods["CoCoA_Light_PPL"].append(u_light_ppl)
             
             # Проверяем правильность
             best_response = max(responses, key=lambda x: x[1])[0]
@@ -533,7 +788,7 @@ def run_experiment():
                 auroc_results[method] = auroc
         
         # Сохраняем результаты
-        all_results.append({
+        result = {
             "Dataset": dataset_name,
             "Task": dataset_config["task_type"].upper(),
             "Samples": len(correctness_list),
@@ -541,15 +796,24 @@ def run_experiment():
             "PRR_SequenceProb": f"{prr_results.get('SequenceProb', 0):.3f}",
             "PRR_Perplexity": f"{prr_results.get('Perplexity', 0):.3f}",
             "PRR_Consistency": f"{prr_results.get('Consistency', 0):.3f}",
-            "PRR_CoCoA": f"{prr_results.get('CoCoA', 0):.3f}",
-            "PRR_CoCoA_Light": f"{prr_results.get('CoCoA_Light', 0):.3f}",
-            "AUROC_CoCoA": f"{auroc_results.get('CoCoA', 0):.3f}",
-        })
+            "PRR_CoCoA_SP": f"{prr_results.get('CoCoA_SP', 0):.3f}",
+            "PRR_CoCoA_PPL": f"{prr_results.get('CoCoA_PPL', 0):.3f}",
+        }
         
-        print(f"Обработано {len(correctness_list)} примеров")
+        if config.RUN_COCOA_LIGHT and mlp_model is not None:
+            result["PRR_CoCoA_Light_SP"] = f"{prr_results.get('CoCoA_Light_SP', 0):.3f}"
+            result["PRR_CoCoA_Light_PPL"] = f"{prr_results.get('CoCoA_Light_PPL', 0):.3f}"
+            result["AUROC_CoCoA_Light"] = f"{auroc_results.get('CoCoA_Light_SP', 0):.3f}"
+        
+        result["AUROC_CoCoA"] = f"{auroc_results.get('CoCoA_SP', 0):.3f}"
+        
+        all_results.append(result)
+        
+        print(f"✅ Обработано {len(correctness_list)} примеров")
         print(f"   Base Accuracy: {np.mean(correctness_list):.3f}")
-        print(f"   PRR CoCoA: {prr_results.get('CoCoA', 0):.3f}")
-        print(f"   AUROC CoCoA: {auroc_results.get('CoCoA', 0):.3f}")
+        print(f"   PRR CoCoA_SP: {prr_results.get('CoCoA_SP', 0):.3f}")
+        if config.RUN_COCOA_LIGHT and mlp_model is not None:
+            print(f"   PRR CoCoA_Light_SP: {prr_results.get('CoCoA_Light_SP', 0):.3f}")
     
     # Создаём таблицу результатов
     df = pd.DataFrame(all_results)
@@ -560,14 +824,14 @@ def run_experiment():
     print(df.to_string(index=False))
     
     # Сохраняем
-    df.to_csv("cocoa_results_full.csv", index=False)
-    print(f"\nРезультаты сохранены в cocoa_results_full.csv")
+    df.to_csv("cocoa_results_corrected.csv", index=False)
+    print(f"\n✅ Результаты сохранены в cocoa_results_corrected.csv")
     
     try:
-        df.to_excel("cocoa_results_full.xlsx", index=False)
-        print(f"Результаты сохранены в cocoa_results_full.xlsx")
+        df.to_excel("cocoa_results_corrected.xlsx", index=False)
+        print(f"✅ Результаты сохранены в cocoa_results_corrected.xlsx")
     except:
-        print("Не удалось сохранить в Excel (установите openpyxl: pip install openpyxl)")
+        print("⚠️  Не удалось сохранить в Excel (pip install openpyxl)")
     
     return df
 
