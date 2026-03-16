@@ -7,7 +7,7 @@
 
 ## 🚀 Быстрый старт
 
-### Linux/Mac
+--Linux/Mac--
 ```bash
 # 1. Клонирование/скачивание
 git clone <repo_url>
@@ -21,7 +21,7 @@ chmod +x setup.sh
 source cocoa_env/bin/activate
 python cocoa_experiment_full.py
 
-### Windows
+--Windows--
 REM 1. Настройка
 setup.bat
 
@@ -29,7 +29,7 @@ REM 2. Запуск
 cocoa_env\Scripts\activate
 python cocoa_experiment_full.py
 
-### Make (Linux/Mac)
+--Make (Linux/Mac)--
 make setup    # Настройка
 make run      # Запуск
 make clean    # Очистка
