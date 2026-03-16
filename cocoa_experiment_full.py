@@ -15,6 +15,7 @@ import numpy as np
 from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import BitsAndBytesConfig
 from sentence_transformers import SentenceTransformer
 from datasets import load_dataset
 from sklearn.neural_network import MLPRegressor
@@ -30,18 +31,22 @@ class Config:
     """Конфигурация эксперимента согласно статье"""
     
     # Модель
-    MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-    
+    # Варианты (чем меньше — тем быстрее):
+    #   "Qwen/Qwen2.5-0.5B-Instruct"  — самый быстрый, ~3× быстрее 1.5B
+    #   "Qwen/Qwen2.5-1.5B-Instruct"  — баланс скорость/качество
+    MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+
     # Параметры для CoCoA Light (эмбеддинги)
-    # Для Qwen2.5-1.5B: 24 слоя, берём слой 12 (середина)
+    # Qwen2.5-0.5B: 24 слоя, hidden_size=896, берём слой 12 (середина)
+    # Qwen2.5-1.5B: 28 слоёв, hidden_size=1536, берём слой 14 (середина)
     EMBEDDING_LAYER = 12
-    EMBEDDING_DIM = 1536  # hidden_size для Qwen2.5-1.5B
-    
+    EMBEDDING_DIM = 896   # 896 для 0.5B, 1536 для 1.5B
+
     # Параметры генерации
-    MAX_NEW_TOKENS = 128
+    MAX_NEW_TOKENS = 64   # 128 избыточно для QA; 64 вдвое быстрее
     TEMPERATURE = 0.7
     TOP_P = 0.9
-    NUM_SAMPLES = 10  # Для CoCoA (оригинал: 10-20)
+    NUM_SAMPLES = 5       # 10 по статье, но 5 достаточно для проверки метода
     
     # Датасеты
     DATASETS = {
@@ -49,12 +54,10 @@ class Config:
                      "size": 300, "task_type": "qa"},
         "CoQA": {"name": "coqa", "subset": None, "size": 300, "task_type": "qa"},
         "XSUM": {"name": "xsum", "subset": None, "size": 300, "task_type": "summarization"},
-        "IWSLT_EN_DE": {"name": "iwslt2017", "subset": "en-de", 
-                        "size": 300, "task_type": "translation"},
     }
     
     # Датасет для обучения CoCoA Light (unlabeled held-out set)
-    LIGHT_TRAIN_SIZE = 500  # В статье: 3000-10000
+    LIGHT_TRAIN_SIZE = 200  # В статье: 3000-10000; 200 достаточно для проверки
     
     # Функция сходства
     SIMILARITY_MODEL = "sentence-transformers/LaBSE"
@@ -63,7 +66,7 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     # 4-bit квантование
-    USE_4BIT = True
+    USE_4BIT = False
     
     # Режимы
     RUN_COCOA = True       # Запустить полный CoCoA
@@ -72,7 +75,6 @@ class Config:
 # ============================================================================
 # ЗАГРУЗКА МОДЕЛЕЙ
 # ============================================================================
-
 def load_llm_model(model_name: str, use_4bit: bool = True):
     """Загружает языковую модель с квантованием"""
     
@@ -81,15 +83,20 @@ def load_llm_model(model_name: str, use_4bit: bool = True):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     
     if use_4bit and torch.cuda.is_available():
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
+        # Создаём конфигурацию квантования
+        bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
+        )
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            quantization_config=bnb_config,  # ← Передаём через quantization_config
             trust_remote_code=True,
-            output_hidden_states=True,  # Важно для CoCoA Light!
+            output_hidden_states=True,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -97,7 +104,7 @@ def load_llm_model(model_name: str, use_4bit: bool = True):
             device_map="auto",
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             trust_remote_code=True,
-            output_hidden_states=True,  # Важно для CoCoA Light!
+            output_hidden_states=True,
         )
     
     model.eval()
@@ -210,63 +217,67 @@ def create_prompt(item: Dict) -> str:
 # ГЕНЕРАЦИЯ ОТВЕТОВ С ЭМБЕДДИНГАМИ
 # ============================================================================
 
-def generate_responses_with_embeddings(model, tokenizer, prompt: str, 
+def generate_responses_with_embeddings(model, tokenizer, prompt: str,
                                         num_samples: int, config: Config,
                                         return_embeddings: bool = False):
     """
     Генерирует multiple samples и возвращает:
     - (текст, log_probability) для CoCoA
     - эмбеддинги среднего слоя для CoCoA Light
+
+    Все samples генерируются за ОДИН батчевый вызов model.generate().
     """
-    
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, 
+
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
                        max_length=512).to(config.DEVICE)
     input_length = inputs["input_ids"].shape[1]
-    
+
+    # Дублируем вход для батчевой генерации всех N samples за один вызов
+    batch_inputs = {k: v.repeat(num_samples, 1) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **batch_inputs,
+            max_new_tokens=config.MAX_NEW_TOKENS,
+            temperature=config.TEMPERATURE,
+            top_p=config.TOP_P,
+            do_sample=True,
+            return_dict_in_generate=True,
+            output_scores=True,
+            output_hidden_states=return_embeddings,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
     responses = []
     embeddings_list = []
-    
-    for _ in range(num_samples):
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=config.MAX_NEW_TOKENS,
-                temperature=config.TEMPERATURE,
-                top_p=config.TOP_P,
-                do_sample=True,
-                return_dict_in_generate=True,
-                output_scores=True,
-                output_hidden_states=return_embeddings,  # Для CoCoA Light
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        
-        # Декодируем ответ
-        generated_ids = outputs.sequences[0][input_length:]
+
+    for i in range(num_samples):
+        # Декодируем ответ для i-го sample
+        generated_ids = outputs.sequences[i][input_length:]
         text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        
-        # Вычисляем log probability
+
+        # Вычисляем log probability для i-го sample
         if hasattr(outputs, 'scores') and outputs.scores:
             log_probs = []
-            for i, score in enumerate(outputs.scores):
-                token_id = outputs.sequences[0][input_length + i]
-                log_prob = torch.log_softmax(score[0], dim=0)[token_id].item()
+            for t, score in enumerate(outputs.scores):
+                token_id = outputs.sequences[i][input_length + t]
+                log_prob = torch.log_softmax(score[i], dim=0)[token_id].item()
                 log_probs.append(log_prob)
             avg_log_prob = np.mean(log_probs) if log_probs else 0.0
         else:
             avg_log_prob = 0.0
-        
+
         responses.append((text, avg_log_prob))
-        
+
         # Извлекаем эмбеддинги среднего слоя (для CoCoA Light)
-        if return_embeddings and hasattr(outputs, 'hidden_states'):
-            # hidden_states: tuple of (batch_size, seq_len, hidden_dim) for each layer
-            if outputs.hidden_states and len(outputs.hidden_states) > config.EMBEDDING_LAYER:
-                # Берём эмбеддинги последнего сгенерированного токена
-                layer_hidden = outputs.hidden_states[config.EMBEDDING_LAYER][-1]  # Last token
-                # Mean pooling по последнему измерению
-                embedding = layer_hidden[0, -1, :].cpu().numpy()  # [hidden_dim]
+        if return_embeddings:
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states and len(outputs.hidden_states) > config.EMBEDDING_LAYER:
+                layer_hidden = outputs.hidden_states[config.EMBEDDING_LAYER][-1]
+                embedding = layer_hidden[i, -1, :].cpu().float().numpy()
                 embeddings_list.append(embedding)
-    
+            else:
+                embeddings_list.append(None)  # Keep in sync with responses
+
     return responses, embeddings_list if return_embeddings else None
 
 def generate_greedy_with_embedding(model, tokenizer, prompt: str, config: Config):
@@ -308,7 +319,7 @@ def generate_greedy_with_embedding(model, tokenizer, prompt: str, config: Config
     embedding = None
     if outputs.hidden_states and len(outputs.hidden_states) > config.EMBEDDING_LAYER:
         layer_hidden = outputs.hidden_states[config.EMBEDDING_LAYER][-1]
-        embedding = layer_hidden[0, -1, :].cpu().numpy()
+        embedding = layer_hidden[0, -1, :].cpu().float().numpy()
     
     return (text, avg_log_prob), embedding
 
@@ -419,31 +430,38 @@ def compute_semantic_similarity(model, text1: str, text2: str) -> float:
 def compute_consistency_uncertainty(similarity_model, responses: List[Tuple[str, float]]) -> float:
     """
     U_cons: Consistency-based uncertainty (Formula 8 в статье)
-    
+
     Û_cons(y*|x) = (1/M) × Σ(1 - s(y*, yⁱ))
+
+    Все тексты кодируются за один батчевый вызов encode().
     """
-    
+
     if len(responses) < 2:
         return 1.0
-    
+
     texts = [r[0] for r in responses]
     best_text = max(responses, key=lambda x: x[1])[0]  # y*
-    
-    # Вычисляем сходство лучшего ответа со всеми остальными
-    similarities = []
-    for i, text in enumerate(texts):
-        if text != best_text:  # Не сравниваем с самим собой
-            sim = compute_semantic_similarity(similarity_model, best_text, text)
-            similarities.append(sim)
-    
-    if not similarities:
+
+    other_texts = [t for t in texts if t != best_text]
+    if not other_texts:
         return 1.0
-    
-    # Среднее сходство
-    avg_similarity = np.mean(similarities)
-    
-    # Uncertainty = 1 - average similarity (Formula 8)
-    uncertainty = 1.0 - avg_similarity
+
+    try:
+        # Один батчевый encode вместо N отдельных вызовов
+        all_texts = [best_text] + other_texts
+        embs = similarity_model.encode(all_texts, convert_to_numpy=True,
+                                       show_progress_bar=False, batch_size=32)
+        best_emb = embs[0]
+        other_embs = embs[1:]
+
+        # Векторизованное косинусное сходство
+        dots = other_embs @ best_emb
+        norms = np.linalg.norm(other_embs, axis=1) * np.linalg.norm(best_emb) + 1e-8
+        similarities = (dots / norms + 1) / 2
+        uncertainty = 1.0 - float(np.mean(similarities))
+    except Exception:
+        uncertainty = 1.0
+
     return uncertainty
 
 def compute_cocoa_uncertainty(responses: List[Tuple[str, float]], 
@@ -626,15 +644,21 @@ def train_cocoa_light(model, tokenizer, similarity_model, train_data: List[Dict]
             return_embeddings=True
         )
         
-        # Фильтруем пустые ответы
-        responses = [(t, p) for t, p in responses if t.strip()]
-        
-        if len(responses) < 2 or not embeddings:
-            continue
-        
+        # Фильтруем пустые ответы, сохраняя выравнивание с embeddings
+        if embeddings:
+            paired = [(r, e) for r, e in zip(responses, embeddings) if r[0].strip() and e is not None]
+            if len(paired) < 2:
+                continue
+            responses = [x[0] for x in paired]
+            embeddings = [x[1] for x in paired]
+        else:
+            responses = [(t, p) for t, p in responses if t.strip()]
+            if len(responses) < 2:
+                continue
+
         # Вычисляем true consistency uncertainty (target для MLP)
         true_cons_uncertainty = compute_consistency_uncertainty(similarity_model, responses)
-        
+
         # Берём эмбеддинг из лучшего ответа (greedy-like)
         best_idx = np.argmax([r[1] for r in responses])
         best_embedding = embeddings[best_idx]
@@ -735,9 +759,14 @@ def run_experiment():
                 return_embeddings=config.RUN_COCOA_LIGHT
             )
             
-            # Фильтруем пустые ответы
-            responses = [(t, p) for t, p in responses if t.strip()]
-            
+            # Фильтруем пустые ответы, сохраняя выравнивание с embeddings
+            if embeddings:
+                paired = [(r, e) for r, e in zip(responses, embeddings) if r[0].strip() and e is not None]
+                responses = [x[0] for x in paired]
+                embeddings = [x[1] for x in paired]
+            else:
+                responses = [(t, p) for t, p in responses if t.strip()]
+
             if not responses:
                 continue
             
