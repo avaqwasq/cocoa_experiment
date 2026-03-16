@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 CoCoA Uncertainty Quantification Experiment
-ПРАВИЛЬНАЯ РЕАЛИЗАЦИЯ согласно статье arXiv:2502.04964
+согласно статье arXiv:2502.04964
 
 CoCoA: Multiple samples + confidence × consistency
 CoCoA Light: MLP на эмбеддингах среднего слоя + greedy decoding
@@ -78,7 +78,7 @@ class Config:
 def load_llm_model(model_name: str, use_4bit: bool = True):
     """Загружает языковую модель с квантованием"""
     
-    print(f"🔄 Загрузка модели: {model_name}")
+    print(f"Загрузка модели: {model_name}")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     
@@ -108,14 +108,14 @@ def load_llm_model(model_name: str, use_4bit: bool = True):
         )
     
     model.eval()
-    print(f"✅ Модель загружена на {next(model.parameters()).device}")
+    print(f"Модель загружена на {next(model.parameters()).device}")
     return model, tokenizer
 
 def load_similarity_model(model_name: str):
     """Загружает модель для вычисления семантического сходства"""
-    print(f"🔄 Загрузка модели сходства: {model_name}")
+    print(f"Загрузка модели сходства: {model_name}")
     similarity_model = SentenceTransformer(model_name)
-    print(f"✅ Модель сходства загружена")
+    print(f"Модель сходства загружена")
     return similarity_model
 
 # ============================================================================
@@ -128,7 +128,7 @@ def load_mini_dataset(dataset_name: str, dataset_config: Dict) -> List[Dict]:
     task_type = dataset_config["task_type"]
     size = dataset_config["size"]
     
-    print(f"🔄 Загрузка датасета: {dataset_name} ({task_type}, {size} примеров)")
+    print(f"Загрузка датасета: {dataset_name} ({task_type}, {size} примеров)")
     
     data = []
     
@@ -182,7 +182,7 @@ def load_mini_dataset(dataset_name: str, dataset_config: Dict) -> List[Dict]:
                     "tgt_lang": "de"
                 })
     
-    print(f"✅ Загружено {len(data)} примеров")
+    print(f"Загружено {len(data)} примеров")
     return data
 
 # ============================================================================
@@ -357,7 +357,7 @@ class CoCoALightMLP:
             embeddings: [n_samples, embedding_dim]
             targets: [n_samples] - true consistency uncertainty
         """
-        print(f"🔄 Обучение CoCoA Light MLP...")
+        print(f"Обучение CoCoA Light MLP...")
         print(f"   Размер training set: {len(embeddings)} примеров")
         print(f"   Размерность эмбеддингов: {embeddings.shape[1]}")
         
@@ -370,7 +370,7 @@ class CoCoALightMLP:
         
         # Оценка качества
         train_score = self.model.score(embeddings_scaled, targets)
-        print(f"✅ MLP обучена (R² = {train_score:.4f})")
+        print(f"MLP обучена (R² = {train_score:.4f})")
     
     def predict(self, embedding: np.ndarray) -> float:
         """Предсказывает consistency uncertainty из одного эмбеддинга"""
@@ -627,7 +627,7 @@ def train_cocoa_light(model, tokenizer, similarity_model, train_data: List[Dict]
     """
     
     print("\n" + "=" * 80)
-    print("🎓 ОБУЧЕНИЕ COCOA LIGHT MLP")
+    print("ОБУЧЕНИЕ COCOA LIGHT MLP")
     print("=" * 80)
     
     embeddings_list = []
@@ -670,7 +670,7 @@ def train_cocoa_light(model, tokenizer, similarity_model, train_data: List[Dict]
     embeddings_array = np.array(embeddings_list)
     targets_array = np.array(targets_list)
     
-    print(f"\n✅ Подготовлено {len(embeddings_array)} примеров для обучения")
+    print(f"\nПодготовлено {len(embeddings_array)} примеров для обучения")
     
     # Создаём и обучаем MLP
     mlp = CoCoALightMLP(input_dim=embeddings_array.shape[1], hidden_dim=2048)
@@ -688,7 +688,7 @@ def run_experiment():
     config = Config()
     
     print("=" * 80)
-    print("🚀 CoCoA Uncertainty Quantification Experiment")
+    print("CoCoA Uncertainty Quantification Experiment")
     print("   Задачи: QA, Summarization, Machine Translation (NMT)")
     print("=" * 80)
     print(f"Модель: {config.MODEL_NAME}")
@@ -725,7 +725,7 @@ def run_experiment():
     
     for dataset_name, dataset_config in config.DATASETS.items():
         print(f"\n{'='*80}")
-        print(f"📊 Датасет: {dataset_name} ({dataset_config['task_type'].upper()})")
+        print(f"Датасет: {dataset_name} ({dataset_config['task_type'].upper()})")
         print(f"{'='*80}")
         
         # Загружаем данные
@@ -838,7 +838,7 @@ def run_experiment():
         
         all_results.append(result)
         
-        print(f"✅ Обработано {len(correctness_list)} примеров")
+        print(f"Обработано {len(correctness_list)} примеров")
         print(f"   Base Accuracy: {np.mean(correctness_list):.3f}")
         print(f"   PRR CoCoA_SP: {prr_results.get('CoCoA_SP', 0):.3f}")
         if config.RUN_COCOA_LIGHT and mlp_model is not None:
@@ -854,13 +854,13 @@ def run_experiment():
     
     # Сохраняем
     df.to_csv("cocoa_results_corrected.csv", index=False)
-    print(f"\n✅ Результаты сохранены в cocoa_results_corrected.csv")
+    print(f"\nРезультаты сохранены в cocoa_results_corrected.csv")
     
     try:
         df.to_excel("cocoa_results_corrected.xlsx", index=False)
-        print(f"✅ Результаты сохранены в cocoa_results_corrected.xlsx")
+        print(f"Результаты сохранены в cocoa_results_corrected.xlsx")
     except:
-        print("⚠️  Не удалось сохранить в Excel (pip install openpyxl)")
+        print("Не удалось сохранить в Excel (pip install openpyxl)")
     
     return df
 
